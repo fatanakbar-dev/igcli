@@ -1,0 +1,652 @@
+#!/usr/bin/env python3
+"""igcli — Instagram CLI ala wacli.
+
+Perintah berbasis subcommand untuk baca profil, kirim/baca DM, dan outreach
+prospek, di atas connector Instagram yang sudah terhubung. Output default
+tabel ringkas; --json untuk machine-readable.
+
+Contoh:
+  igcli accounts
+  igcli profile --username mensflix.id
+  igcli resolve mensflix.id
+  igcli dm inbox --first 10
+  igcli dm send --to mensflix.id --text "Halo kak..." --dry-run
+  igcli dm outreach --dry-run
+  igcli doctor
+"""
+import argparse, json, os, sqlite3, subprocess, sys
+from datetime import datetime, timezone, timedelta
+
+VERSION = "0.1.0"
+WIB = timezone(timedelta(hours=7))
+IG_CLI = "/opt/hatch/bin/instagram-cli"
+IG_MSG = "/opt/hatch/bin/instagram-messages-cli"
+STORE_DIR = os.path.expanduser("~/.local/state/igcli")
+DB_PATH = os.path.join(STORE_DIR, "igcli.db")
+
+# Akun default per perintah (fbid). @ahliwebmurah_id non-profesional:
+# DM ke orang asing diblokir IG (403). @bikinweb.murah profesional: bisa.
+DEFAULT_ACCOUNT = "17841447943236724"   # @ahliwebmurah_id
+PRO_ACCOUNT = "17841460805634325"       # @bikinweb.murah (profesional)
+
+
+def run_cli(args, timeout=90):
+    p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    return p.returncode, p.stdout, p.stderr
+
+
+def jload(s):
+    try:
+        return json.loads(s)
+    except Exception:
+        return {}
+
+
+def my_accounts():
+    """Daftar akun IG sendiri: username -> {fbid, igid}."""
+    rc, out, _ = run_cli([IG_CLI, "accounts"])
+    accs = {}
+    if rc == 0:
+        for a in jload(out).get("accounts", []):
+            accs[a.get("username")] = {"fbid": a.get("user_fbid"), "igid": a.get("user_igid")}
+    return accs
+
+
+def msg_accounts():
+    """Status koneksi messaging per fbid."""
+    rc, out, _ = run_cli([IG_MSG, "accounts"])
+    st = {}
+    if rc == 0:
+        for a in jload(out).get("accounts", []):
+            st[a.get("user_fbid")] = {"connected": a.get("connected"),
+                                     "professional": a.get("is_professional"),
+                                     "username": a.get("username")}
+    return st
+
+
+def resolve_account(name_or_fbid):
+    """Terima @username / username / fbid -> fbid. None kalau tidak ketemu."""
+    if not name_or_fbid:
+        return DEFAULT_ACCOUNT
+    s = name_or_fbid.strip().lstrip("@")
+    if s.isdigit():
+        return s
+    accs = my_accounts()
+    hit = accs.get(s)
+    return hit["fbid"] if hit else None
+
+
+def username_of(fbid):
+    for u, a in my_accounts().items():
+        if a["fbid"] == fbid:
+            return "@" + u
+    return fbid
+
+
+# ---------- store lokal (ala wacli) ----------
+def store():
+    os.makedirs(STORE_DIR, exist_ok=True)
+    con = sqlite3.connect(DB_PATH)
+    con.execute("""CREATE TABLE IF NOT EXISTS threads(
+        thread_fbid TEXT PRIMARY KEY, account_fbid TEXT,
+        participants TEXT, preview TEXT, updated_at TEXT)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS messages(
+        message_id TEXT PRIMARY KEY, thread_fbid TEXT,
+        sender TEXT, text TEXT, sent_at TEXT)""")
+    return con
+
+
+# ---------- commands ----------
+def cmd_accounts(args):
+    accs = my_accounts()
+    msg = msg_accounts()
+    rows = []
+    for u, a in accs.items():
+        m = msg.get(a["fbid"], {})
+        rows.append({"username": "@" + u, "fbid": a["fbid"],
+                     "messaging": "connected" if m.get("connected") else "-",
+                     "professional": "yes" if m.get("professional") else "no"})
+    if args.json:
+        print(json.dumps(rows, indent=1))
+    else:
+        print(f"{'USERNAME':<20}{'MESSAGING':<12}{'PROFESSIONAL'}")
+        for r in rows:
+            print(f"{r['username']:<20}{r['messaging']:<12}{r['professional']}")
+
+
+def cmd_auth_status(args):
+    msg = msg_accounts()
+    accs = my_accounts()
+    rows = []
+    for u, a in accs.items():
+        m = msg.get(a["fbid"], {})
+        rows.append({"account": "@" + u,
+                     "authenticated": True,
+                     "messaging_connected": bool(m.get("connected"))})
+    if args.json:
+        print(json.dumps(rows, indent=1))
+    else:
+        for r in rows:
+            mc = "ya" if r["messaging_connected"] else "TIDAK"
+            print(f"{r['account']:<20} auth: ya   messaging: {mc}")
+
+
+def cmd_profile(args):
+    acct = resolve_account(args.account)
+    rc, out, err = run_cli([IG_CLI, "profile", "--account-id", acct,
+                            "--username", args.username.lstrip("@")])
+    data = jload(out)
+    profs = data.get("profiles", [])
+    if not profs:
+        print(f"Profil @{args.username} tidak ketemu. {err[:200]}", file=sys.stderr)
+        sys.exit(1)
+    p = profs[0]
+    if args.json:
+        print(json.dumps(p, indent=1))
+    else:
+        print(f"@{p.get('username')} — {p.get('name')}")
+        print(f"  fbid: {p.get('user_id')}")
+        print(f"  followers: {p.get('follower_count')} | posts: {p.get('post_count')} | "
+              f"private: {p.get('is_private')} | verified: {p.get('is_verified')}")
+        print(f"  bio: {str(p.get('bio') or '')[:120]}")
+
+
+def cmd_resolve(args):
+    """Handle -> fbid (+ info ringkas). Dipakai outreach untuk --recipient-user-fbids."""
+    acct = resolve_account(args.account)
+    handle = args.handle.lstrip("@")
+    rc, out, err = run_cli([IG_CLI, "profile", "--account-id", acct, "--username", handle])
+    profs = jload(out).get("profiles", [])
+    if not profs or not profs[0].get("user_id"):
+        print(json.dumps({"handle": handle, "found": False}))
+        sys.exit(1)
+    p = profs[0]
+    info = {"handle": "@" + p.get("username"), "fbid": p.get("user_id"),
+            "name": p.get("name"), "followers": p.get("follower_count"),
+            "private": p.get("is_private"), "found": True}
+    print(json.dumps(info, indent=1))
+
+
+def cmd_dm_inbox(args):
+    acct = resolve_account(args.account)
+    rc, out, err = run_cli([IG_MSG, "inbox", "--account-id", acct,
+                            "--first", str(args.first), "--message-count", "1"])
+    threads = jload(out).get("threads", [])
+    if args.json:
+        print(json.dumps(threads, indent=1)[:4000])
+        return
+    print(f"Inbox {username_of(acct)} — {len(threads)} thread:")
+    for t in threads:
+        names = ", ".join("@" + u.get("username", "?") for u in t.get("users", []))
+        prev = str(t.get("preview", ""))[:50]
+        print(f"  {names:<30} {t.get('thread_fbid')}  {prev}")
+
+
+def cmd_dm_thread(args):
+    acct = resolve_account(args.account)
+    rc, out, err = run_cli([IG_MSG, "thread", "--account-id", acct,
+                            "--thread-fbid", args.id, "--first", str(args.first)])
+    msgs = jload(out).get("messages", [])
+    if args.json:
+        print(json.dumps(msgs, indent=1)[:4000])
+        return
+    for m in msgs:
+        print(f"[{m.get('sender_name', m.get('sender'))}] {m.get('text', '')[:200]}")
+
+
+def cmd_dm_send(args):
+    acct = resolve_account(args.account)
+    to = args.to.strip()
+    fbid = to if to.isdigit() else None
+    handle = None
+    if not fbid:
+        handle = to.lstrip("@")
+        rc, out, _ = run_cli([IG_CLI, "profile", "--account-id", acct, "--username", handle])
+        profs = jload(out).get("profiles", [])
+        if not profs or not profs[0].get("user_id"):
+            print(f"Tidak bisa resolve @{handle}", file=sys.stderr)
+            sys.exit(1)
+        fbid = profs[0]["user_id"]
+    dest = "@" + handle if handle else fbid
+    if args.dry_run:
+        print(json.dumps({"dry_run": True, "from": username_of(acct),
+                          "to": dest, "fbid": fbid, "text": args.text}, indent=1,
+                         ensure_ascii=False))
+        return
+    rc, out, err = run_cli([IG_MSG, "send", "--account-id", acct,
+                            "--recipient-user-fbids", fbid, "--text", args.text],
+                           timeout=120)
+    if rc == 0 and "message_id" in out:
+        print(json.dumps({"sent": True, "to": dest, "result": jload(out)},
+                         ensure_ascii=False))
+    else:
+        print(f"GAGAL: {(out + err)[:400]}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_dm_outreach(args):
+    """1 DM outreach ke prospek berikutnya. Dipakai cron tiap 45 mnt."""
+    sys.path.insert(0, os.path.expanduser("~/workspace/prospek-hunting"))
+    try:
+        import ig_dm_outreach as o
+    except ImportError:
+        print("dm outreach butuh ~/workspace/prospek-hunting/ig_dm_outreach.py "
+              "(tidak termasuk di repo ini).", file=sys.stderr)
+        sys.exit(1)
+    acct = args.account or PRO_ACCOUNT  # default akun profesional (bisa DM ke orang asing)
+    if resolve_account(acct) is None:
+        print("Akun tidak dikenal", file=sys.stderr)
+        sys.exit(1)
+    o.ACCOUNT_ID = resolve_account(acct)
+    log = o.load_log()
+    if o.sent_today(log) >= (args.max_per_day or o.DAILY_CAP):
+        print(json.dumps({"skipped": "cap_harian_tercapai"}))
+        return
+    p = o.pick_prospect(log)
+    if not p:
+        print(json.dumps({"skipped": "tidak_ada_prospek"}))
+        return
+    handle = p["sumber"].split("instagram:", 1)[1].strip().lstrip("@")
+    fbid = o.resolve_fbid(handle)
+    now = o.now_wib()
+    entry = {"prospek_id": p["id"], "nama": p["nama"], "handle": handle,
+             "kategori": p["kategori"], "via": username_of(o.ACCOUNT_ID),
+             "sent_at": now.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    if not fbid:
+        entry.update(status="skip", error="resolve_gagal")
+        log.append(entry); o.save_log(log)
+        print(json.dumps(entry, ensure_ascii=False))
+        return
+    entry["fbid"] = fbid
+    text = o.ig_dm_message(p["nama"], p["kategori"] or "")
+    if args.dry_run:
+        entry.update(status="dry_run", text=text)
+        print(json.dumps(entry, indent=1, ensure_ascii=False))
+        return
+    ok, info = o.send_dm(fbid, text)
+    entry.update(status="sent" if ok else "failed")
+    if not ok:
+        entry["error"] = info
+    log.append(entry); o.save_log(log)
+    print(json.dumps({"status": entry["status"], "to": "@" + handle,
+                      "via": entry["via"]}, ensure_ascii=False))
+    if not ok:
+        sys.exit(1)
+
+
+def cmd_post_reel(args):
+    """Posting reels: MP4 + cover + caption (bungkus post-feed)."""
+    acct = resolve_account(args.account)
+    for f in [args.file, args.cover]:
+        if not os.path.isfile(f) or "/tmp" in os.path.abspath(f):
+            print(f"File harus ada di ~/workspace/, bukan /tmp: {f}", file=sys.stderr)
+            sys.exit(1)
+    cmd = [IG_CLI, "post-feed", "--account-id", acct,
+           "--file", args.file, "--cover", args.cover]
+    if args.caption:
+        cmd += ["--caption", args.caption]
+    if args.dry_run:
+        print(json.dumps({"dry_run": True, "from": username_of(acct),
+                          "file": args.file, "cover": args.cover,
+                          "caption": args.caption}, ensure_ascii=False, indent=1))
+        return
+    if not publish_lock():
+        print("Ada proses posting lain yang berjalan — batalkan untuk keamanan.",
+              file=sys.stderr)
+        sys.exit(1)
+    try:
+        rc, out, err = run_cli(cmd, timeout=600)
+        print(out[:500] or err[:500])
+        if rc != 0:
+            sys.exit(1)
+    finally:
+        publish_unlock()
+
+
+def cmd_post_photo(args):
+    """Posting foto/carousel: 1+ file gambar + caption."""
+    acct = resolve_account(args.account)
+    cmd = [IG_CLI, "post-feed", "--account-id", acct]
+    for f in args.file:
+        if not os.path.isfile(f) or "/tmp" in os.path.abspath(f):
+            print(f"File harus ada di ~/workspace/, bukan /tmp: {f}", file=sys.stderr)
+            sys.exit(1)
+        cmd += ["--file", f]
+    if args.caption:
+        cmd += ["--caption", args.caption]
+    if args.dry_run:
+        print(json.dumps({"dry_run": True, "from": username_of(acct),
+                          "files": args.file, "caption": args.caption},
+                         ensure_ascii=False, indent=1))
+        return
+    if not publish_lock():
+        print("Ada proses posting lain yang berjalan — batalkan untuk keamanan.",
+              file=sys.stderr)
+        sys.exit(1)
+    try:
+        rc, out, err = run_cli(cmd, timeout=600)
+        print(out[:500] or err[:500])
+        if rc != 0:
+            sys.exit(1)
+    finally:
+        publish_unlock()
+
+
+def cmd_post_story(args):
+    """Posting story. --draft dulu untuk render tanpa publish."""
+    acct = resolve_account(args.account)
+    f = args.file
+    if not os.path.isfile(f) or "/tmp" in os.path.abspath(f):
+        print(f"File harus ada di ~/workspace/, bukan /tmp: {f}", file=sys.stderr)
+        sys.exit(1)
+    cmd = [IG_CLI, "post-story", "--account-id", acct, "--file", f]
+    if args.editor_json:
+        cmd += ["--editor-json", args.editor_json]
+    if args.draft or args.dry_run:
+        cmd.append("--draft")
+        rc, out, err = run_cli(cmd, timeout=600)
+        print(out[:800] or err[:500])
+        if rc != 0:
+            sys.exit(1)
+        return
+    if not publish_lock():
+        print("Ada proses posting lain yang berjalan — batalkan untuk keamanan.",
+              file=sys.stderr)
+        sys.exit(1)
+    try:
+        rc, out, err = run_cli(cmd, timeout=600)
+        print(out[:800] or err[:500])
+        if rc != 0:
+            sys.exit(1)
+    finally:
+        publish_unlock()
+
+
+
+def cmd_posts(args):
+    """Daftar postingan sebuah akun."""
+    acct = resolve_account(args.account)
+    rc, out, _ = run_cli([IG_CLI, "posts", "--account-id", acct,
+                          "--username", args.username.lstrip("@"),
+                          "--first", str(args.first)])
+    posts = jload(out).get("posts", [])
+    if args.json:
+        print(json.dumps(posts, indent=1)[:4000])
+        return
+    for p in posts:
+        cap = str(p.get("post_caption", ""))[:60].replace("\n", " ")
+        print(f"{p.get('post_id')} | ♥{p.get('likes')} 💬{p.get('comments')} | {cap}")
+
+
+def cmd_comments(args):
+    """Ambil komentar sebuah postingan (berguna untuk prospecting)."""
+    acct = resolve_account(args.account)
+    rc, out, _ = run_cli([IG_CLI, "fetch-post-comments", "--account-id", acct,
+                          "--post-ids", args.post_id, "--first", str(args.first)])
+    data = jload(out)
+    comments = data.get("comments", data.get("results", []))
+    if args.json:
+        print(json.dumps(comments, indent=1)[:4000])
+        return
+    for c in comments if isinstance(comments, list) else []:
+        u = c.get("username", c.get("author", "?"))
+        print(f"@{u}: {str(c.get('text', ''))[:120]}")
+
+
+def cmd_insights(args):
+    """Insight akun sendiri (default 7 hari terakhir)."""
+    acct = resolve_account(args.account)
+    rc, out, err = run_cli([IG_CLI, "account-insights", "--account-id", acct,
+                            "--period", args.period])
+    if args.json:
+        print(out[:4000])
+        return
+    print(out[:2000] or err[:500])
+
+
+def cmd_bio(args):
+    """Update bio (maks 150 karakter)."""
+    acct = resolve_account(args.account)
+    if len(args.text) > 150:
+        print("Bio maksimal 150 karakter.", file=sys.stderr)
+        sys.exit(1)
+    if args.dry_run:
+        print(json.dumps({"dry_run": True, "account": username_of(acct),
+                          "bio": args.text}, ensure_ascii=False))
+        return
+    rc, out, err = run_cli([IG_CLI, "update-bio", "--account-id", acct,
+                            "--bio", args.text])
+    print(out[:500] or err[:500])
+    if rc != 0:
+        sys.exit(1)
+
+
+def cmd_prospect_check(args):
+    """Verifikasi calon prospek: profil + heuristik kecocokan."""
+    acct = resolve_account(args.account)
+    handle = args.handle.lstrip("@")
+    rc, out, _ = run_cli([IG_CLI, "profile", "--account-id", acct, "--username", handle])
+    profs = jload(out).get("profiles", [])
+    if not profs:
+        print(json.dumps({"handle": "@" + handle, "found": False}))
+        sys.exit(1)
+    p = profs[0]
+    bio = str(p.get("bio") or "")
+    biz = p.get("business_info") or {}
+    followers = p.get("follower_count") or 0
+    has_website = bool(p.get("website") or biz.get("website") or
+                       "linktr.ee" in bio.lower() or ".com" in bio.lower() or
+                       ".id" in bio.lower() or ".co.id" in bio.lower())
+    has_contact = bool(biz.get("email") or biz.get("phone") or
+                       "wa.me" in bio.lower() or "whatsapp" in bio.lower())
+    checks = []
+    if p.get("is_private"):
+        checks.append(("skip", "akun private"))
+    if followers < 50:
+        checks.append(("kurang", f"followers kecil ({followers})"))
+    elif followers > 100000:
+        checks.append(("kurang", f"terlalu besar ({followers}) — kemungkinan sudah punya tim/agensi"))
+    if has_website:
+        checks.append(("catatan", "kemungkinan sudah punya website/link — cek manual"))
+    if has_contact:
+        checks.append(("plus", "ada kontak di bio (email/WA)"))
+    if not checks:
+        checks.append(("cocok", "lolos filter dasar"))
+    result = {"handle": "@" + p.get("username"), "nama": p.get("name"),
+              "followers": followers, "posts": p.get("post_count"),
+              "private": p.get("is_private"), "bio": bio[:150],
+              "website_terdeteksi": has_website, "kontak_terdeteksi": has_contact,
+              "penilaian": [{"status": s, "alasan": r} for s, r in checks]}
+    print(json.dumps(result, indent=1, ensure_ascii=False))
+
+
+def publish_lock():
+    """Lockfile sederhana: cegah 2 proses posting jalan barengan.
+    Return True kalau lock didapat, False kalau ada posting lain berjalan."""
+    lock = os.path.join(STORE_DIR, "post.lock")
+    os.makedirs(STORE_DIR, exist_ok=True)
+    if os.path.exists(lock):
+        try:
+            age = datetime.now().timestamp() - os.path.getmtime(lock)
+            if age < 3600:  # lock kedaluwarsa 1 jam (antisipasi crash)
+                return False
+        except OSError:
+            pass
+    open(lock, "w").write(str(os.getpid()))
+    return True
+
+
+def publish_unlock():
+    try:
+        os.remove(os.path.join(STORE_DIR, "post.lock"))
+    except OSError:
+        pass
+
+
+def cmd_sync(args):
+    acct = resolve_account(args.account)
+    rc, out, _ = run_cli([IG_MSG, "inbox", "--account-id", acct,
+                          "--first", str(args.first), "--message-count", "3"])
+    threads = jload(out).get("threads", [])
+    con = store()
+    n = 0
+    for t in threads:
+        names = ",".join("@" + u.get("username", "?") for u in t.get("users", []))
+        con.execute("INSERT OR REPLACE INTO threads VALUES (?,?,?,?,?)",
+                    (t.get("thread_fbid"), acct, names,
+                     str(t.get("preview", ""))[:200],
+                     datetime.now(WIB).isoformat()))
+        n += 1
+    con.commit()
+    print(f"Sync {n} thread dari {username_of(acct)} ke {DB_PATH}")
+
+
+def cmd_store_stats(args):
+    con = store()
+    t = con.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
+    m = con.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    print(f"store: {DB_PATH}\nthreads: {t}\nmessages: {m}")
+
+
+def cmd_doctor(args):
+    print(f"igcli v{VERSION}")
+    accs = my_accounts()
+    msg = msg_accounts()
+    print(f"akun IG: {len(accs)} | messaging terhubung: "
+          f"{sum(1 for a in accs.values() if msg.get(a['fbid'], {}).get('connected'))}")
+    print(f"store: {DB_PATH} ({'ada' if os.path.exists(DB_PATH) else 'belum ada'})")
+    print(f"prospek DB: {'ada' if os.path.exists(os.path.expanduser('~/workspace/prospek-hunting/prospek.db')) else 'HILANG'}")
+    # uji resolve cepat
+    rc, out, _ = run_cli([IG_CLI, "profile", "--account-id", DEFAULT_ACCOUNT,
+                          "--username", "instagram"])
+    ok = bool(jload(out).get("profiles"))
+    print(f"profile lookup: {'OK' if ok else 'GAGAL'}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="igcli", description="Instagram CLI ala wacli")
+    ap.add_argument("--account", help="@username atau fbid pengirim (default @ahliwebmurah_id)")
+    ap.add_argument("--json", action="store_true", help="output JSON")
+    ap.add_argument("--version", action="store_true")
+    sub = ap.add_subparsers(dest="cmd")
+
+    sub.add_parser("accounts", help="daftar akun + status messaging")
+    p = sub.add_parser("auth", help="status autentikasi")
+    p.add_argument("what", nargs="?", default="status")
+
+    p = sub.add_parser("profile", help="lihat profil IG")
+    p.add_argument("--username", required=True)
+
+    p = sub.add_parser("resolve", help="handle -> fbid")
+    p.add_argument("handle")
+
+    p = sub.add_parser("dm", help="direct messages")
+    dsub = p.add_subparsers(dest="dm_cmd")
+    p2 = dsub.add_parser("inbox", help="daftar thread DM")
+    p2.add_argument("--first", type=int, default=10)
+    p2 = dsub.add_parser("thread", help="baca thread")
+    p2.add_argument("--id", required=True)
+    p2.add_argument("--first", type=int, default=20)
+    p2 = dsub.add_parser("send", help="kirim DM")
+    p2.add_argument("--to", required=True, help="@handle atau fbid")
+    p2.add_argument("--text", required=True)
+    p2.add_argument("--dry-run", action="store_true")
+    p2 = dsub.add_parser("outreach", help="kirim 1 DM ke prospek berikutnya")
+    p2.add_argument("--dry-run", action="store_true")
+    p2.add_argument("--max-per-day", type=int, default=10)
+
+    p = sub.add_parser("post", help="posting konten")
+    psub = p.add_subparsers(dest="post_cmd")
+    p2 = psub.add_parser("reel", help="posting reels (MP4 + cover)")
+    p2.add_argument("--file", required=True)
+    p2.add_argument("--cover", required=True)
+    p2.add_argument("--caption", default="")
+    p2.add_argument("--dry-run", action="store_true")
+    p2 = psub.add_parser("photo", help="posting foto/carousel")
+    p2.add_argument("--file", required=True, action="append")
+    p2.add_argument("--caption", default="")
+    p2.add_argument("--dry-run", action="store_true")
+    p2 = psub.add_parser("story", help="posting story")
+    p2.add_argument("--file", required=True)
+    p2.add_argument("--editor-json", default="")
+    p2.add_argument("--draft", action="store_true", help="render saja, tanpa publish")
+    p2.add_argument("--dry-run", action="store_true")
+
+    p = sub.add_parser("posts", help="daftar postingan akun")
+    p.add_argument("--username", required=True)
+    p.add_argument("--first", type=int, default=10)
+
+    p = sub.add_parser("comments", help="ambil komentar postingan")
+    p.add_argument("--post-id", required=True)
+    p.add_argument("--first", type=int, default=20)
+
+    p = sub.add_parser("insights", help="insight akun sendiri")
+    p.add_argument("--period", default="last_7_days",
+                   choices=["last_7_days", "last_30_days", "last_90_days",
+                            "this_month", "this_year"])
+
+    p = sub.add_parser("bio", help="update bio (maks 150 karakter)")
+    p.add_argument("--text", required=True)
+    p.add_argument("--dry-run", action="store_true")
+
+    p = sub.add_parser("prospect", help="verifikasi calon prospek")
+    p.add_argument("handle")
+
+    p = sub.add_parser("sync", help="sync inbox ke store lokal")
+    p.add_argument("--first", type=int, default=20)
+    sub.add_parser("store", help="info store lokal").add_argument(
+        "what", nargs="?", default="stats")
+    sub.add_parser("doctor", help="diagnostik")
+    sub.add_parser("version", help="versi igcli")
+
+    args = ap.parse_args()
+    if getattr(args, "version", False):
+        print(f"igcli v{VERSION}")
+        return
+    if args.cmd == "version":
+        print(f"igcli v{VERSION}")
+        return
+    if args.cmd == "accounts":
+        cmd_accounts(args)
+    elif args.cmd == "auth":
+        cmd_auth_status(args)
+    elif args.cmd == "profile":
+        cmd_profile(args)
+    elif args.cmd == "resolve":
+        cmd_resolve(args)
+    elif args.cmd == "dm" and args.dm_cmd == "inbox":
+        cmd_dm_inbox(args)
+    elif args.cmd == "dm" and args.dm_cmd == "thread":
+        cmd_dm_thread(args)
+    elif args.cmd == "dm" and args.dm_cmd == "send":
+        cmd_dm_send(args)
+    elif args.cmd == "dm" and args.dm_cmd == "outreach":
+        cmd_dm_outreach(args)
+    elif args.cmd == "post" and args.post_cmd == "reel":
+        cmd_post_reel(args)
+    elif args.cmd == "post" and args.post_cmd == "photo":
+        cmd_post_photo(args)
+    elif args.cmd == "post" and args.post_cmd == "story":
+        cmd_post_story(args)
+    elif args.cmd == "posts":
+        cmd_posts(args)
+    elif args.cmd == "comments":
+        cmd_comments(args)
+    elif args.cmd == "insights":
+        cmd_insights(args)
+    elif args.cmd == "bio":
+        cmd_bio(args)
+    elif args.cmd == "prospect":
+        cmd_prospect_check(args)
+    elif args.cmd == "sync":
+        cmd_sync(args)
+    elif args.cmd == "store":
+        cmd_store_stats(args)
+    elif args.cmd == "doctor":
+        cmd_doctor(args)
+    else:
+        ap.print_help()
+
+
+if __name__ == "__main__":
+    main()
