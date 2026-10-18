@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+
+# Backup / editor
+*.bak
+*.swp
+*~
+.DS_Store
+
+# Local runtime (never commit)
+*.log
+post.lock
+
+# igcli local store & outreach logs live OUTSIDE the repo:
+#   ~/.local/state/igcli/
+#   ~/workspace/ahliwebmurah/db/ig_dm_log.json
+# Do not copy them here.
+
+# Secrets (igcli itself stores none; keep it that way)
+.env
+*.pem
+*.key
+credentials*.json
+secrets*.json
